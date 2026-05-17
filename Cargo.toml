@@ -1,0 +1,18 @@
+[package]
+name = "echo-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.186"
+rustc-hash = "2.1.2"
+
+[profile.release]
+strip = false
+opt-level = 3
+codegen-units = 1 
+lto = "fat"
+
+[profile.samply]
+inherits = "release"
+debug = true
