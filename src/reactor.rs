@@ -7,21 +7,19 @@ use std::os::fd::RawFd;
 use std::ptr;
 use std::rc::Rc;
 
-use rustc_hash::FxHashMap as HashMap;
-
 use crate::HandleImpl;
 
 pub struct Reactor {
     epfd: RawFd,
     shutdown_fd: RawFd,
     tasks_ready: Rc<RefCell<VecDeque<RawFd>>>,
-    tasks_storage: Rc<RefCell<HashMap<RawFd, HandleImpl>>>,
+    tasks_storage: Rc<RefCell<Vec<Option<(RawFd, HandleImpl)>>>>,
 }
 
 impl Reactor {
     pub fn new(
         tasks_ready: Rc<RefCell<VecDeque<RawFd>>>,
-        tasks_storage: Rc<RefCell<HashMap<RawFd, HandleImpl>>>,
+        tasks_storage: Rc<RefCell<Vec<Option<(RawFd, HandleImpl)>>>>,
     ) -> io::Result<Self> {
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
 
@@ -109,7 +107,11 @@ impl Reactor {
                     libc::close(event.u64 as _);
                 }
 
-                for (fd, _task) in self.tasks_storage.borrow_mut().drain() {
+                for task in self.tasks_storage.borrow_mut().drain(..) {
+                    let Some((fd, _task)) = task else {
+                        continue;
+                    };
+
                     _ = self.unregister(fd);
                 }
 

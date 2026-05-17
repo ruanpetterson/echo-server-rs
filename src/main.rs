@@ -8,17 +8,17 @@ use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 
-use rustc_hash::FxHashMap as HashMap;
-
 mod reactor;
 
-const IS_ECHO_SERVER: bool = false;
+// FIXME: echo server is broken, but it's works for small inputs.
+const IS_ECHO_SERVER: bool = true;
+
 const HTTP_REQUEST: &[u8] = b"GET / HTTP/1.1";
-const HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nHello, world!\r\n";
+const HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: keep-alive\r\n\r\nHello, world!\r\n";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let tasks_ready = Rc::new(RefCell::new(VecDeque::with_capacity(8192)));
-    let tasks_storage = Rc::new(RefCell::new(HashMap::default()));
+    let tasks_ready = Rc::new(RefCell::new(VecDeque::with_capacity(1024)));
+    let tasks_storage = Rc::new(RefCell::new(Vec::with_capacity(1024)));
 
     let reactor = Rc::new(reactor::Reactor::new(
         tasks_ready.clone(),
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tasks_storage
         .borrow_mut()
-        .insert(fd, HandleImpl::from(accept_fn));
+        .push(Some((fd, HandleImpl::from(accept_fn))));
 
     let mut fds = std::iter::from_fn(|| {
         let mut tasks = tasks_ready.borrow_mut();
@@ -54,12 +54,32 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         for fd in fds.by_ref() {
-            let Some(mut task) = tasks_storage.borrow_mut().remove(&fd) else {
-                continue;
+            let (index, fd, mut task) = {
+                let mut tasks_storage = tasks_storage.borrow_mut();
+
+                let Some(index) = tasks_storage
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .position(|(fd_, _)| *fd_ == fd)
+                else {
+                    continue;
+                };
+
+                let Some((fd, task)) = unsafe { tasks_storage.get_unchecked_mut(index) }.take()
+                else {
+                    continue;
+                };
+
+                (index, fd, task)
             };
 
-            if task.handle().is_continue() {
-                tasks_storage.borrow_mut().insert(fd, task);
+            let task_still_pending = task.handle().is_continue();
+            let mut tasks_storage = tasks_storage.borrow_mut();
+
+            if task_still_pending {
+                _ = unsafe { tasks_storage.get_unchecked_mut(index) }.insert((fd, task));
+            } else {
+                _ = tasks_storage.swap_remove(index);
             }
         }
 
@@ -79,7 +99,7 @@ struct Acceptor {
     reactor: Rc<reactor::Reactor>,
     listener: TcpListener,
     tasks_ready: Rc<RefCell<VecDeque<RawFd>>>,
-    tasks_storage: Rc<RefCell<HashMap<RawFd, HandleImpl>>>,
+    tasks_storage: Rc<RefCell<Vec<Option<(RawFd, HandleImpl)>>>>,
 }
 
 impl Handle for Acceptor {
@@ -99,10 +119,12 @@ impl Handle for Acceptor {
             };
 
             stream.set_nonblocking(true).unwrap();
+            stream.set_nodelay(!IS_ECHO_SERVER).unwrap();
 
             let handle_fn = Handler {
                 stream,
                 reactor: self.reactor.clone(),
+                buf: vec![],
                 written: None,
             };
 
@@ -110,24 +132,20 @@ impl Handle for Acceptor {
                 .borrow_mut()
                 .push_back(handle_fn.stream.as_raw_fd());
 
-            self.tasks_storage
-                .borrow_mut()
-                .insert(handle_fn.stream.as_raw_fd(), HandleImpl::from(handle_fn));
+            self.tasks_storage.borrow_mut().push(Some((
+                handle_fn.stream.as_raw_fd(),
+                HandleImpl::from(handle_fn),
+            )));
         }
 
         ControlFlow::Continue(())
     }
 }
 
-impl Drop for Acceptor {
-    fn drop(&mut self) {
-        _ = self.reactor.unregister(self.listener.as_raw_fd());
-    }
-}
-
 struct Handler {
     reactor: Rc<reactor::Reactor>,
     stream: TcpStream,
+    buf: Vec<u8>,
     written: Option<usize>,
 }
 
@@ -135,32 +153,42 @@ impl Handle for Handler {
     fn handle(&mut self) -> ControlFlow<(), ()> {
         let mut buf = [0u8; 1024];
 
-        let write = |written: &mut usize,
+        let write = |written_opt: &mut Option<usize>,
+                     buf: &[u8],
                      reactor: &Rc<reactor::Reactor>,
                      mut stream: &TcpStream| {
-            return match stream.write(&HTTP_RESPONSE[*written..]) {
-                Ok(n) => {
-                    *written += n;
-                    if *written == HTTP_RESPONSE.len() {
-                        return ControlFlow::Break(());
-                    }
+            if let Some(written) = written_opt.as_mut() {
+                let buf = if IS_ECHO_SERVER { buf } else { HTTP_RESPONSE };
+                let buf = &buf[*written..];
+                // let buf = unsafe { HTTP_RESPONSE.get_unchecked(*written..) };
+                return match stream.write(buf) {
+                    Ok(n) => {
+                        *written += n;
 
-                    _ = reactor.register_with(stream.as_raw_fd(), libc::EPOLLIN | libc::EPOLLOUT);
-                    ControlFlow::Continue(())
-                }
-                Err(e) if let ErrorKind::WouldBlock = e.kind() => {
-                    _ = reactor.register_with(stream.as_raw_fd(), libc::EPOLLIN | libc::EPOLLOUT);
-                    ControlFlow::Continue(())
-                }
-                Err(_) => {
-                    // eprintln!("ERROR(handler): {e}");
-                    ControlFlow::Break(())
-                }
+                        if *written == HTTP_RESPONSE.len() {
+                            _ = reactor.register(stream.as_raw_fd());
+                            _ = written_opt.take();
+                            return ControlFlow::Continue(());
+                        }
+
+                        _ = reactor
+                            .register_with(stream.as_raw_fd(), libc::EPOLLIN | libc::EPOLLOUT);
+                        ControlFlow::Continue(())
+                    }
+                    Err(e) if let ErrorKind::WouldBlock = e.kind() => {
+                        _ = reactor
+                            .register_with(stream.as_raw_fd(), libc::EPOLLIN | libc::EPOLLOUT);
+                        ControlFlow::Continue(())
+                    }
+                    Err(_) => ControlFlow::Break(()),
+                };
             };
+
+            ControlFlow::Continue(())
         };
 
-        if let Some(written) = self.written.as_mut() {
-            return write(written, &self.reactor, &self.stream);
+        if self.written.is_some() {
+            return write(&mut self.written, &self.buf, &self.reactor, &self.stream);
         }
 
         match self.stream.read(&mut buf) {
@@ -172,14 +200,18 @@ impl Handle for Handler {
                 return ControlFlow::Break(());
             }
             Err(e) => {
-                eprintln!("ERROR(handler): {e}");
+                if !matches!(e.kind(), ErrorKind::ConnectionReset) {
+                    eprintln!("ERROR(handler): {e}");
+                }
+
                 return ControlFlow::Break(());
             }
             Ok(n) => {
                 if IS_ECHO_SERVER {
-                    todo!()
-                    // _ = self.stream.write_all(&buf[..n]);
-                    // continue;
+                    _ = self.written.insert(0);
+                    self.buf.clear();
+                    self.buf.extend_from_slice(&buf);
+                    return write(&mut self.written, &self.buf, &self.reactor, &self.stream);
                 }
 
                 let Some(path) = &buf[..n].split(|&c| c == b'\n').next() else {
@@ -187,19 +219,13 @@ impl Handle for Handler {
                 };
 
                 if matches!(path.trim_ascii(), HTTP_REQUEST) {
-                    let written = self.written.insert(0);
-                    return write(written, &self.reactor, &self.stream);
+                    _ = self.written.insert(0);
+                    return write(&mut self.written, &self.buf, &self.reactor, &self.stream);
                 }
 
                 ControlFlow::Break(())
             }
         }
-    }
-}
-
-impl Drop for Handler {
-    fn drop(&mut self) {
-        _ = self.reactor.unregister(self.stream.as_raw_fd());
     }
 }
 
