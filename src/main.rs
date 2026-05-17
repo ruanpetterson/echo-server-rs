@@ -103,6 +103,7 @@ impl Handle for Acceptor {
             let handle_fn = Handler {
                 stream,
                 reactor: self.reactor.clone(),
+                written: None,
             };
 
             self.tasks_ready
@@ -127,40 +128,70 @@ impl Drop for Acceptor {
 struct Handler {
     reactor: Rc<reactor::Reactor>,
     stream: TcpStream,
+    written: Option<usize>,
 }
 
 impl Handle for Handler {
     fn handle(&mut self) -> ControlFlow<(), ()> {
         let mut buf = [0u8; 1024];
 
-        loop {
-            match self.stream.read(&mut buf) {
-                Err(e) if let ErrorKind::WouldBlock = e.kind() => {
-                    _ = self.reactor.register(self.stream.as_raw_fd());
-                    return ControlFlow::Continue(());
-                }
-                Ok(0) => {
-                    return ControlFlow::Break(());
-                }
-                Err(e) => {
-                    eprintln!("ERROR(handler): {e}");
-                    return ControlFlow::Break(());
-                }
+        let write = |written: &mut usize,
+                     reactor: &Rc<reactor::Reactor>,
+                     mut stream: &TcpStream| {
+            return match stream.write(&HTTP_RESPONSE[*written..]) {
                 Ok(n) => {
-                    if IS_ECHO_SERVER {
-                        _ = self.stream.write_all(&buf[..n]);
-                        continue;
-                    }
-
-                    let Some(path) = &buf[..n].split(|&c| c == b'\n').next() else {
-                        return ControlFlow::Break(());
-                    };
-
-                    if matches!(path.trim_ascii(), HTTP_REQUEST) {
-                        _ = self.stream.write_all(HTTP_RESPONSE);
+                    *written += n;
+                    if *written == HTTP_RESPONSE.len() {
                         return ControlFlow::Break(());
                     }
+
+                    _ = reactor.register_with(stream.as_raw_fd(), libc::EPOLLIN | libc::EPOLLOUT);
+                    ControlFlow::Continue(())
                 }
+                Err(e) if let ErrorKind::WouldBlock = e.kind() => {
+                    _ = reactor.register_with(stream.as_raw_fd(), libc::EPOLLIN | libc::EPOLLOUT);
+                    ControlFlow::Continue(())
+                }
+                Err(_) => {
+                    // eprintln!("ERROR(handler): {e}");
+                    ControlFlow::Break(())
+                }
+            };
+        };
+
+        if let Some(written) = self.written.as_mut() {
+            return write(written, &self.reactor, &self.stream);
+        }
+
+        match self.stream.read(&mut buf) {
+            Err(e) if let ErrorKind::WouldBlock = e.kind() => {
+                _ = self.reactor.register(self.stream.as_raw_fd());
+                return ControlFlow::Continue(());
+            }
+            Ok(0) => {
+                return ControlFlow::Break(());
+            }
+            Err(e) => {
+                eprintln!("ERROR(handler): {e}");
+                return ControlFlow::Break(());
+            }
+            Ok(n) => {
+                if IS_ECHO_SERVER {
+                    todo!()
+                    // _ = self.stream.write_all(&buf[..n]);
+                    // continue;
+                }
+
+                let Some(path) = &buf[..n].split(|&c| c == b'\n').next() else {
+                    return ControlFlow::Break(());
+                };
+
+                if matches!(path.trim_ascii(), HTTP_REQUEST) {
+                    let written = self.written.insert(0);
+                    return write(written, &self.reactor, &self.stream);
+                }
+
+                ControlFlow::Break(())
             }
         }
     }
