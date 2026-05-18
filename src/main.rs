@@ -1,3 +1,12 @@
+//! Single-threaded event-driven TCP server built around an epoll-backed reactor.
+//!
+//! The binary can operate as either a small echo server or a fixed-response HTTP
+//! server, depending on the `IS_ECHO_SERVER` toggle.
+
+#![warn(missing_docs)]
+#![warn(clippy::missing_docs_in_private_items)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -8,14 +17,19 @@ use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 
+/// Linux-specific reactor implementation used by the server loop.
 mod reactor;
 
 // FIXME: echo server is broken, but it's works for small inputs.
+/// Toggles the binary between echo mode and fixed-response HTTP mode.
 const IS_ECHO_SERVER: bool = true;
 
+/// Request-line prefix accepted by the HTTP mode branch.
 const HTTP_REQUEST: &[u8] = b"GET / HTTP/1.1";
+/// Full HTTP response written back when the request matches `HTTP_REQUEST`.
 const HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: keep-alive\r\n\r\nHello, world!\r\n";
 
+/// Starts the listener, schedules the initial accept task, and runs the reactor loop.
 fn main() -> Result<(), Box<dyn Error>> {
     let tasks_ready = Rc::new(RefCell::new(VecDeque::with_capacity(1024)));
     let tasks_storage = Rc::new(RefCell::new(Vec::with_capacity(1024)));
@@ -65,6 +79,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
 
+                // SAFETY: `index` comes from `position` on this exact vector borrow, so it is
+                // in-bounds for the duration of this access.
                 let Some((fd, task)) = unsafe { tasks_storage.get_unchecked_mut(index) }.take()
                 else {
                     continue;
@@ -77,6 +93,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut tasks_storage = tasks_storage.borrow_mut();
 
             if task_still_pending {
+                // SAFETY: `index` still refers to the same slot that was taken above, and the
+                // vector has not been resized or reordered before reinserting into that slot.
                 _ = unsafe { tasks_storage.get_unchecked_mut(index) }.insert((fd, task));
             } else {
                 _ = tasks_storage.swap_remove(index);
@@ -91,14 +109,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Common interface for scheduled tasks driven by ready file descriptors.
 trait Handle {
+    /// Advances the task once and reports whether it should remain scheduled.
     fn handle(&mut self) -> ControlFlow<(), ()>;
 }
 
+/// Accepts new client connections and schedules a `Handler` for each accepted stream.
 struct Acceptor {
+    /// Reactor used to register interest in the listener file descriptor.
     reactor: Rc<reactor::Reactor>,
+    /// Non-blocking listening socket bound by `main`.
     listener: TcpListener,
+    /// Queue of file descriptors ready to be processed by the main loop.
     tasks_ready: Rc<RefCell<VecDeque<RawFd>>>,
+    /// Storage backing the task queue keyed by file descriptor.
     tasks_storage: Rc<RefCell<Vec<Option<(RawFd, HandleImpl)>>>>,
 }
 
@@ -142,10 +167,15 @@ impl Handle for Acceptor {
     }
 }
 
+/// Reads from and writes to a single client connection.
 struct Handler {
+    /// Reactor used to adjust readiness interests for the stream.
     reactor: Rc<reactor::Reactor>,
+    /// Non-blocking TCP stream owned by this handler.
     stream: TcpStream,
+    /// Buffered payload for echo-mode writes.
     buf: Vec<u8>,
+    /// Number of bytes already written for the current response, if any.
     written: Option<usize>,
 }
 
@@ -194,17 +224,17 @@ impl Handle for Handler {
         match self.stream.read(&mut buf) {
             Err(e) if let ErrorKind::WouldBlock = e.kind() => {
                 _ = self.reactor.register(self.stream.as_raw_fd());
-                return ControlFlow::Continue(());
+                ControlFlow::Continue(())
             }
             Ok(0) => {
-                return ControlFlow::Break(());
+                ControlFlow::Break(())
             }
             Err(e) => {
                 if !matches!(e.kind(), ErrorKind::ConnectionReset) {
                     eprintln!("ERROR(handler): {e}");
                 }
 
-                return ControlFlow::Break(());
+                ControlFlow::Break(())
             }
             Ok(n) => {
                 if IS_ECHO_SERVER {
@@ -229,8 +259,11 @@ impl Handle for Handler {
     }
 }
 
+/// Tagged task storage used by the scheduler to keep heterogeneous handlers in one vector.
 enum HandleImpl {
+    /// Accept loop task bound to the listening socket.
     Acceptor(Acceptor),
+    /// Per-connection read/write task.
     Handler(Handler),
 }
 
