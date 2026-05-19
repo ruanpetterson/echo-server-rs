@@ -42,19 +42,28 @@ impl Reactor {
             events: vec![libc::epoll_event { events: 0, u64: 0 }; event_capacity.max(1)],
         };
 
-        reactor.register_read(reactor.shutdown_fd)?;
+        reactor.add_read(reactor.shutdown_fd)?;
 
         Ok(reactor)
     }
 
-    /// Registers `fd` for readable events, updating the existing registration if needed.
-    pub(crate) fn register_read(&self, fd: RawFd) -> io::Result<()> {
-        self.register_with(fd, libc::EPOLLIN)
+    /// Registers `fd` for readable events.
+    pub(crate) fn add_read(&self, fd: RawFd) -> io::Result<()> {
+        self.control(fd, libc::EPOLL_CTL_ADD, libc::EPOLLIN | libc::EPOLLONESHOT)
     }
 
-    /// Registers `fd` for readable and writable events.
-    pub(crate) fn register_read_write(&self, fd: RawFd) -> io::Result<()> {
-        self.register_with(fd, libc::EPOLLIN | libc::EPOLLOUT)
+    /// Updates `fd` to readable events.
+    pub(crate) fn modify_read(&self, fd: RawFd) -> io::Result<()> {
+        self.control(fd, libc::EPOLL_CTL_MOD, libc::EPOLLIN | libc::EPOLLONESHOT)
+    }
+
+    /// Updates `fd` to readable and writable events.
+    pub(crate) fn modify_read_write(&self, fd: RawFd) -> io::Result<()> {
+        self.control(
+            fd,
+            libc::EPOLL_CTL_MOD,
+            libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLONESHOT,
+        )
     }
 
     /// Removes `fd` from the epoll interest list.
@@ -96,15 +105,14 @@ impl Reactor {
                 return Ok(Wait::Shutdown);
             }
 
-            _ = self.unregister(fd);
             ready.push_back(fd);
         }
 
         Ok(Wait::Ready)
     }
 
-    /// Registers `fd` with explicit epoll flags, updating an existing registration if needed.
-    fn register_with(&self, fd: RawFd, flags: i32) -> io::Result<()> {
+    /// Applies an epoll control operation with explicit readiness flags.
+    fn control(&self, fd: RawFd, operation: i32, flags: i32) -> io::Result<()> {
         let mut event = libc::epoll_event {
             events: flags as u32,
             u64: fd as u64,
@@ -112,16 +120,8 @@ impl Reactor {
 
         // SAFETY: `self.epfd` and `fd` are live descriptors, and `event` remains valid across
         // the syscall.
-        if unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut event) } < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(error);
-            }
-
-            // SAFETY: same as above; this updates an existing registration in place.
-            if unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut event) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+        if unsafe { libc::epoll_ctl(self.epfd, operation, fd, &mut event) } < 0 {
+            return Err(io::Error::last_os_error());
         }
 
         Ok(())

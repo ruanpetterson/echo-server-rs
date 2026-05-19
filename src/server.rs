@@ -52,11 +52,11 @@ where
         listener.set_nonblocking(true)?;
 
         let listener_fd = listener.as_raw_fd();
-        let mut ready = ReadyQueue::with_capacity(config.task_capacity);
+        let ready = ReadyQueue::with_capacity(config.task_capacity);
         let mut tasks = TaskStorage::with_capacity(config.task_capacity);
         let reactor = Reactor::new(config.event_capacity)?;
 
-        ready.push_back(listener_fd);
+        reactor.add_read(listener_fd)?;
         tasks.insert(listener_fd, Task::from(Acceptor::<P>::new(listener)));
 
         Ok(Self {
@@ -96,6 +96,7 @@ where
         {
             self.tasks.put(index, entry);
         } else {
+            _ = self.reactor.unregister(entry.fd);
             self.tasks.remove(index);
         }
 

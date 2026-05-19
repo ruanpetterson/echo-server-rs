@@ -16,12 +16,22 @@ const READ_BUFFER_LEN: usize = 1024;
 pub(crate) struct Connection<P> {
     /// Non-blocking TCP stream.
     stream: TcpStream,
+    /// Reused read buffer.
+    read_buf: [u8; READ_BUFFER_LEN],
     /// Pending response bytes.
-    write_buf: Vec<u8>,
+    write_buf: Option<WriteSource>,
     /// Number of pending response bytes already written.
-    written: Option<usize>,
+    written: usize,
     /// Protocol marker for static specialization.
     protocol: PhantomData<P>,
+}
+
+/// Source of the currently pending write.
+enum WriteSource {
+    /// Static protocol response.
+    Static(&'static [u8]),
+    /// Bytes stored in the connection-owned write buffer.
+    Buffered(Vec<u8>),
 }
 
 impl<P> Connection<P> {
@@ -29,8 +39,9 @@ impl<P> Connection<P> {
     pub(crate) fn new(stream: TcpStream) -> Self {
         Self {
             stream,
-            write_buf: Vec::new(),
-            written: None,
+            read_buf: [0; READ_BUFFER_LEN],
+            write_buf: None,
+            written: 0,
             protocol: PhantomData,
         }
     }
@@ -47,15 +58,13 @@ where
 {
     /// Advances this connection once.
     pub(crate) fn handle(&mut self, reactor: &Reactor) -> io::Result<TaskStatus> {
-        if self.written.is_some() {
+        if self.write_buf.is_some() {
             return self.flush(reactor);
         }
 
-        let mut read_buf = [0u8; READ_BUFFER_LEN];
-
-        match self.stream.read(&mut read_buf) {
+        match self.stream.read(&mut self.read_buf) {
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                reactor.register_read(self.fd())?;
+                reactor.modify_read(self.fd())?;
                 Ok(TaskStatus::Pending)
             }
             Ok(0) => Ok(TaskStatus::Complete),
@@ -67,11 +76,17 @@ where
                 Ok(TaskStatus::Complete)
             }
             Ok(read) => {
-                self.write_buf.clear();
-                self.written =
-                    P::prepare_response(&read_buf[..read], &mut self.write_buf).then_some(0);
+                let request = &self.read_buf[..read];
 
-                if self.written.is_some() {
+                self.write_buf = if let Some(response) = P::static_response(request) {
+                    Some(WriteSource::Static(response))
+                } else {
+                    let mut buf = vec![];
+                    P::prepare_response(request, &mut buf).then_some(WriteSource::Buffered(buf))
+                };
+                self.written = 0;
+
+                if self.write_buf.is_some() {
                     self.flush(reactor)
                 } else {
                     Ok(TaskStatus::Complete)
@@ -82,28 +97,33 @@ where
 
     /// Writes as much of the pending response as the socket accepts.
     fn flush(&mut self, reactor: &Reactor) -> io::Result<TaskStatus> {
-        let Some(written) = self.written.as_mut() else {
+        let Some(write_source) = self.write_buf.as_ref() else {
             return Ok(TaskStatus::Pending);
         };
+        let response = match write_source {
+            WriteSource::Static(response) => *response,
+            WriteSource::Buffered(response) => response,
+        };
 
-        while *written < self.write_buf.len() {
-            match self.stream.write(&self.write_buf[*written..]) {
+        while self.written < response.len() {
+            match self.stream.write(&response[self.written..]) {
                 Ok(0) => {
-                    reactor.register_read_write(self.fd())?;
+                    reactor.modify_read_write(self.fd())?;
                     return Ok(TaskStatus::Pending);
                 }
-                Ok(w) => *written += w,
+                Ok(w) => self.written += w,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    reactor.register_read_write(self.fd())?;
+                    reactor.modify_read_write(self.fd())?;
                     return Ok(TaskStatus::Pending);
                 }
                 Err(_) => return Ok(TaskStatus::Complete),
             }
         }
 
-        self.write_buf.clear();
-        self.written = None;
-        reactor.register_read(self.fd())?;
+        self.write_buf = None;
+        self.written = 0;
+        reactor.modify_read(self.fd())?;
+
         Ok(TaskStatus::Pending)
     }
 }

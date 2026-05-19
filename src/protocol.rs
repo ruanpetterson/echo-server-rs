@@ -7,6 +7,11 @@ pub trait Protocol {
 
     /// Builds a response for `request` into `response`.
     fn prepare_response(request: &[u8], response: &mut Vec<u8>) -> bool;
+
+    /// Returns a static response for protocols that do not need per-request response allocation.
+    fn static_response(_request: &[u8]) -> Option<&'static [u8]> {
+        None
+    }
 }
 
 /// Echo protocol that writes back exactly the bytes read from the socket.
@@ -26,16 +31,26 @@ impl Protocol for HttpHelloWorld {
     const TCP_NODELAY: bool = true;
 
     fn prepare_response(request: &[u8], response: &mut Vec<u8>) -> bool {
-        let Some(request_line) = request.split(|&byte| byte == b'\n').next() else {
+        let Some(static_response) = Self::static_response(request) else {
             return false;
         };
 
+        response.extend_from_slice(static_response);
+        true
+    }
+
+    fn static_response(request: &[u8]) -> Option<&'static [u8]> {
+        // N.B. using question mark bloat the codegen.
+        #[allow(clippy::question_mark)]
+        let Some(request_line) = request.split(|&byte| byte == b'\n').next() else {
+            return None;
+        };
+
         if request_line.trim_ascii() != HTTP_REQUEST_LINE {
-            return false;
+            return None;
         }
 
-        response.extend_from_slice(HTTP_RESPONSE);
-        true
+        Some(HTTP_RESPONSE)
     }
 }
 

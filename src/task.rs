@@ -29,24 +29,28 @@ pub(crate) struct TaskStorage<P> {
 impl<P> TaskStorage<P> {
     /// Creates task storage with an initial capacity.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(capacity),
-        }
+        let mut entries = Vec::with_capacity(capacity);
+        entries.resize_with(capacity, || None);
+
+        Self { entries }
     }
 
     /// Inserts a new task for `fd`.
     pub(crate) fn insert(&mut self, fd: RawFd, task: Task<P>) {
-        self.entries.push(Some(TaskEntry { fd, task }));
+        let index = fd as usize;
+
+        if self.entries.len() <= index {
+            self.entries.resize_with(index + 1, || None);
+        }
+
+        self.entries[index] = Some(TaskEntry { fd, task });
     }
 
     /// Takes the task registered for `fd`, leaving its slot empty.
     pub(crate) fn take(&mut self, fd: RawFd) -> Option<(usize, TaskEntry<P>)> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.as_ref().is_some_and(|entry| entry.fd == fd))?;
-
+        let index = fd as usize;
         let entry = self.entries.get_mut(index)?.take()?;
+
         Some((index, entry))
     }
 
@@ -57,7 +61,7 @@ impl<P> TaskStorage<P> {
 
     /// Removes a previously taken task slot.
     pub(crate) fn remove(&mut self, index: usize) {
-        _ = self.entries.swap_remove(index);
+        self.entries[index] = None;
     }
 }
 
@@ -111,5 +115,77 @@ impl<P> From<Acceptor<P>> for Task<P> {
 impl<P> From<Connection<P>> for Task<P> {
     fn from(connection: Connection<P>) -> Self {
         Self::Connection(connection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::os::fd::RawFd;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+    use super::{Task, TaskStorage};
+    use crate::acceptor::Acceptor;
+    use crate::protocol::Protocol;
+
+    struct TestProtocol;
+
+    impl Protocol for TestProtocol {
+        const TCP_NODELAY: bool = false;
+
+        fn prepare_response(_request: &[u8], _response: &mut Vec<u8>) -> bool {
+            false
+        }
+    }
+
+    fn task() -> Task<TestProtocol> {
+        let fd = File::open("/dev/null").unwrap().into_raw_fd();
+        // SAFETY: the test never calls listener operations. It only needs an owned fd so dropping
+        // the task closes a valid descriptor without requiring network sandbox permissions.
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+
+        Task::from(Acceptor::new(listener))
+    }
+
+    #[test]
+    fn storage_takes_tasks_by_fd() {
+        let mut storage = TaskStorage::with_capacity(4);
+
+        storage.insert(3, task());
+        storage.insert(5, task());
+
+        let (_, entry) = storage.take(5).unwrap();
+        assert_eq!(entry.fd, 5);
+        assert!(storage.take(5).is_none());
+
+        let (_, entry) = storage.take(3).unwrap();
+        assert_eq!(entry.fd, 3);
+    }
+
+    #[test]
+    fn storage_grows_to_high_fd() {
+        let mut storage = TaskStorage::with_capacity(1);
+        let high_fd: RawFd = 128;
+
+        storage.insert(high_fd, task());
+
+        let (_, entry) = storage.take(high_fd).unwrap();
+        assert_eq!(entry.fd, high_fd);
+    }
+
+    #[test]
+    fn storage_puts_and_removes_by_index() {
+        let mut storage = TaskStorage::with_capacity(4);
+
+        storage.insert(3, task());
+        let (index, entry) = storage.take(3).unwrap();
+
+        storage.put(index, entry);
+        assert!(storage.take(3).is_some());
+
+        storage.insert(3, task());
+        let (index, _) = storage.take(3).unwrap();
+        storage.remove(index);
+        assert!(storage.take(3).is_none());
     }
 }

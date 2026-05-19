@@ -43,7 +43,7 @@ where
             let stream = match self.listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    reactor.register_read(self.listener.as_raw_fd())?;
+                    reactor.modify_read(self.listener.as_raw_fd())?;
                     return Ok(TaskStatus::Pending);
                 }
                 Err(error) => {
@@ -59,6 +59,7 @@ where
             let connection = Connection::<P>::new(stream);
             let fd = connection.fd();
 
+            reactor.add_read(fd)?;
             ready.push_back(fd);
             tasks.insert(fd, Task::from(connection));
         }
